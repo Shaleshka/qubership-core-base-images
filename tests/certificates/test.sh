@@ -19,13 +19,38 @@ export_image_trust_store() {
   openssl crl2pkcs7 -nocrl -certfile "${output_file}.crt" | openssl pkcs7 -print_certs -noout >"${output_file}"
 }
 
+test_restore_volumes_data() {
+  echo "Test: restore_volumes_data restores certs to a simulated emptyDir (BusyBox cp -Rn fix)"
+  # This directly tests the core bugfix: the old code used
+  #   cp -Rn /app/volumes/certs/. /etc/ssl/certs
+  # which silently copies zero files on BusyBox 1.37+ because the src/. idiom causes cp to
+  # compute the destination as dest/. — which already exists — and -n (no-clobber) aborts.
+  # The fix uses glob expansion so each file is addressed individually:
+  #   cp -Rn /app/volumes/certs/* /app/volumes/certs/.[!.]* /etc/ssl/certs/
+  #
+  # The test overrides the entrypoint to:
+  #  1. clear /etc/ssl/certs (simulate Kubernetes emptyDir — empty at container start)
+  #  2. extract and run only restore_volumes_data() from the image's entrypoint
+  #  3. assert that cert files were actually copied back
+  local count
+  count=$(docker run --rm --entrypoint=bash "${@}" "$IMAGE" \
+    -c '
+      rm -rf /etc/ssl/certs/* /etc/ssl/certs/java 2>/dev/null || true
+      eval "$(awk "/^restore_volumes_data\(\)/,/^\}$/ {print; if (/^\}$/) exit}" /usr/bin/entrypoint.sh)"
+      restore_volumes_data
+      find /etc/ssl/certs -type f 2>/dev/null | wc -l
+    ')
+  count="${count//[[:space:]]/}"
+  [ "${count:-0}" -gt 0 ] || fail "restore_volumes_data restored 0 files — BusyBox cp -Rn /app/volumes/certs/. bug is present"
+}
+
 export_image_trust_store_with_emptydir() {
   local output_file=${1:?Missed mandatory parameter: output file}
   shift
-  echo "Export certificate list from: $IMAGE, emptyDir at /etc/ssl/certs (restore_volumes_data test)"
-  # --tmpfs /etc/ssl/certs simulates a Kubernetes emptyDir mount over the VOLUME-declared path,
-  # wiping all baked-in certs. restore_volumes_data() must restore them from /app/volumes/certs/.
-  # Without the fix, BusyBox cp -Rn /app/volumes/certs/. /etc/ssl/certs silently skipped all files.
+  echo "Export certificate list from: $IMAGE, emptyDir at /etc/ssl/certs (restore_volumes_data integration test)"
+  # --tmpfs /etc/ssl/certs simulates a Kubernetes emptyDir mount over the VOLUME-declared path.
+  # restore_volumes_data() must restore certs from /app/volumes/certs/ before load_certificates()
+  # runs update-ca-certificates to rebuild the bundle.
   docker run "${@}" --rm \
       -v "${CERTS_DIR}":/tmp/cert/ \
       --tmpfs /etc/ssl/certs \
@@ -69,10 +94,13 @@ assert_tests "$EXPORTED_CERTS_FILE"
 export_image_trust_store "$EXPORTED_CERTS_FILE" ro -u 10009000
 assert_tests "$EXPORTED_CERTS_FILE"
 
-# Test restore_volumes_data: simulate Kubernetes emptyDir mount over /etc/ssl/certs.
-# This is the exact scenario where the BusyBox cp -Rn /. bug was triggered — the src/.
-# idiom caused cp to silently skip all files when the destination already existed.
-echo "Test restore_volumes_data with emptyDir at /etc/ssl/certs (BusyBox cp -Rn fix)"
+# Unit test: restore_volumes_data in isolation, before update-ca-certificates can compensate.
+# RED on the broken image (BusyBox cp -Rn /. copies 0 files), GREEN on the fixed image.
+test_restore_volumes_data
+test_restore_volumes_data -u 10009000
+
+# Integration test: emptyDir mount over /etc/ssl/certs with the full entrypoint.
+# Validates the end-to-end flow: restore_volumes_data → load_certificates → certs available.
 export_image_trust_store_with_emptydir "$EXPORTED_CERTS_FILE"
 assert_tests "$EXPORTED_CERTS_FILE"
 
